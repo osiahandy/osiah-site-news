@@ -1,36 +1,35 @@
-// Build data/news.json from YouTube (channel feed) + Bandcamp (RSS)
-// No API keys required. Runs in GitHub Actions (Node 20 has global fetch).
-// TODO: put your YouTube UC channel ID(s) below.
-
+// Build data/news.json from YouTube (channel + uploads playlist fallback) + Bandcamp
+// No API keys needed. Runs on GitHub Actions (Node 20).
 import { writeFile } from "node:fs/promises";
 
-const CONFIG = {
-  youtubeChannels: [
-    // e.g. "UCxxxxxxxxxxxxxxxxxxxx"
-  ],
-  bandcampFeed: "https://osiah.bandcamp.com/feed",
-  maxItems: 24,
+/** 1) FILL THIS IN: your YouTube channel IDs (must start with "UC") */
+const YT_CHANNELS = ["UCxSpC-7V5u4rF6eVeHySuxw"];
 
-  // Filters to avoid unrelated results if you add more sources later
-  blocklist: [
-    /\bJOSIAH\b/i,
-    /\bpastor\b/i,
-    /\bsermon\b/i,
-    /\bfootball\b/i,
-    /\bbasketball\b/i,
-    /\barrest(ed)?\b/i,
-  ],
-  // Require OSIAH mention in title/desc (Bandcamp/YouTube usually include)
-  mustInclude: [/\bOSIAH\b/i],
-};
+/** 2) Bandcamp feed (leave as-is unless your URL differs) */
+const BANDCAMP_FEED = "https://osiah.bandcamp.com/feed";
 
-async function fetchText(url) {
+/** 3) Tweak size if you want */
+const MAX_ITEMS = 24;
+
+function uploadsPlaylistId(uc) {
+  // YouTube "uploads" playlist is "UU" + channelId without leading "UC"
+  return uc?.startsWith("UC") ? `UU${uc.slice(2)}` : "";
+}
+
+async function fetchText(url, source) {
   try {
-    const r = await fetch(url, {
-      headers: { "User-Agent": "osiah-news-action/1.0" },
+    const res = await fetch(url, {
+      headers: { "User-Agent": "osiah-news-action/1.1" },
     });
-    return r.ok ? await r.text() : "";
-  } catch {
+    if (!res.ok) {
+      console.log(
+        `[news] ${source} fetch failed: ${res.status} ${res.statusText}`
+      );
+      return "";
+    }
+    return await res.text();
+  } catch (e) {
+    console.log(`[news] ${source} fetch error:`, e?.message || e);
     return "";
   }
 }
@@ -80,28 +79,6 @@ function normalize(item) {
     source: item.source || "News",
   };
 }
-function passesFilters(it) {
-  const hay = `${it.title} ${it.excerpt}`;
-  if (CONFIG.blocklist.some((rx) => rx.test(hay))) return false;
-
-  // Don’t force mustInclude if we *know* the source is your channel/Bandcamp
-  const isTrusted = /bandcamp/i.test(it.source) || /youtube/i.test(it.source);
-  if (!isTrusted && !CONFIG.mustInclude.some((rx) => rx.test(hay)))
-    return false;
-
-  return true;
-}
-function dedupe(items) {
-  const seen = new Set();
-  const out = [];
-  for (const it of items) {
-    const key = (it.link || it.title).toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(it);
-  }
-  return out;
-}
 
 async function parseFeed(xml, source) {
   if (!xml) return [];
@@ -112,7 +89,7 @@ async function parseFeed(xml, source) {
     ),
   ].map((m) => m[0]);
 
-  return blocks
+  const items = blocks
     .map((b) => {
       const title = pickText(b, ["title"]);
       const link = isAtom
@@ -138,35 +115,86 @@ async function parseFeed(xml, source) {
       });
     })
     .filter((x) => x.title && x.link);
+
+  console.log(`[news] parsed ${items.length} from ${source}`);
+  return items;
+}
+
+function dedupe(items) {
+  const seen = new Set();
+  const out = [];
+  for (const it of items) {
+    const key = (it.link || it.title).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(it);
+  }
+  return out;
 }
 
 async function main() {
   const pulls = [];
 
-  for (const ch of CONFIG.youtubeChannels) {
-    const url = `https://www.youtube.com/feeds/videos.xml?channel_id=${encodeURIComponent(
-      ch
+  // YouTube channel + uploads playlist fallback
+  for (const uc of YT_CHANNELS) {
+    if (!uc || !uc.startsWith("UC")) {
+      console.log(`[news] skipped invalid channel id: ${uc}`);
+      continue;
+    }
+    const channelFeed = `https://www.youtube.com/feeds/videos.xml?channel_id=${encodeURIComponent(
+      uc
     )}`;
-    pulls.push(fetchText(url).then((t) => parseFeed(t, "YouTube")));
+    const playlistId = uploadsPlaylistId(uc);
+    const playlistFeed = playlistId
+      ? `https://www.youtube.com/feeds/videos.xml?playlist_id=${encodeURIComponent(
+          playlistId
+        )}`
+      : null;
+
+    pulls.push(
+      fetchText(channelFeed, `YouTube:channel:${uc}`).then((t) =>
+        parseFeed(t, "YouTube")
+      )
+    );
+    if (playlistFeed) {
+      pulls.push(
+        fetchText(playlistFeed, `YouTube:uploads:${playlistId}`).then((t) =>
+          parseFeed(t, "YouTube")
+        )
+      );
+    }
   }
+
+  // Bandcamp
   pulls.push(
-    fetchText(CONFIG.bandcampFeed).then((t) => parseFeed(t, "Bandcamp"))
+    fetchText(BANDCAMP_FEED, "Bandcamp").then((t) => parseFeed(t, "Bandcamp"))
   );
 
-  const all = (await Promise.allSettled(pulls)).flatMap((r) =>
-    r.status === "fulfilled" ? r.value : []
-  );
+  const settled = await Promise.allSettled(pulls);
+  const all = settled.flatMap((r) => (r.status === "fulfilled" ? r.value : []));
 
+  // No extra filters for now — YouTube/Bandcamp are trusted sources.
   const out = dedupe(all)
-    .filter(passesFilters)
     .sort((a, b) => new Date(b.date) - new Date(a.date))
-    .slice(0, CONFIG.maxItems);
+    .slice(0, MAX_ITEMS);
 
   await writeFile("data/news.json", JSON.stringify(out, null, 2));
-  console.log(`Wrote data/news.json (${out.length} items)`);
+  console.log(`[news] wrote data/news.json (${out.length} items)`);
+
+  // Write a debug file (uploaded as Action artifact; not committed)
+  const debug = {
+    counts: {
+      input: all.length,
+      output: out.length,
+    },
+    sample: out.slice(0, 5),
+    when: new Date().toISOString(),
+  };
+  await writeFile("news-debug.json", JSON.stringify(debug, null, 2));
+  console.log("[news] wrote news-debug.json (artifact)");
 }
 
 main().catch((err) => {
-  console.error("news build failed", err);
+  console.error("[news] build failed", err);
   process.exit(1);
 });
